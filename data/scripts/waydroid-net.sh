@@ -15,6 +15,7 @@ else
 fi
 
 USE_LXC_BRIDGE="true"
+NET_MODE='torified'
 LXC_BRIDGE="${vnic}"
 LXC_BRIDGE_MAC="00:16:3e:00:00:01"
 LXC_ADDR="192.168.240.1"
@@ -87,17 +88,54 @@ toggle_iptables_rules () {
     A=${1:-A}
     I=${1:-I}
 
-    if [ -n "$LXC_IPV6_ARG" ] && [ "$LXC_IPV6_NAT" = "true" ]; then
-        $IP6TABLES_BIN $use_iptables_lock -t nat -$A POSTROUTING -s ${LXC_IPV6_NETWORK} ! -d ${LXC_IPV6_NETWORK} -j MASQUERADE
-    fi
-    $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p udp --dport 67 -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p tcp --dport 67 -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p udp --dport 53 -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p tcp --dport 53 -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -$I FORWARD -i ${LXC_BRIDGE} -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -$I FORWARD -o ${LXC_BRIDGE} -j ACCEPT
-    $IPTABLES_BIN $use_iptables_lock -t nat -$A POSTROUTING -s ${LXC_NETWORK} ! -d ${LXC_NETWORK} -j MASQUERADE
-    $IPTABLES_BIN $use_iptables_lock -t mangle -$A POSTROUTING -o ${LXC_BRIDGE} -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+    case "$NET_MODE" in
+        torified)
+
+            # TODO See if kernel forwarding can be disabled
+            # TODO Implement nftables variant
+            # TODO Allow DHCP ?
+
+            # Allow ADB connection
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A INPUT      -p tcp --sport 5555 --syn -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -o ${LXC_BRIDGE} -t nat   -$A OUTPUT     -p tcp --dport 5555 --syn -j ACCEPT
+
+            # Allow SOCKS5 connection
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A INPUT      -p tcp --sport 9050 --syn -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -o ${LXC_BRIDGE} -t nat   -$A OUTPUT     -p tcp --dport 9050 --syn -j ACCEPT
+
+            # Block reserved networks as listed at https://trac.torproject.org/projects/tor/wiki/doc/TransparentProxy#reserved-blocks
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A PREROUTING -d 0.0.0.0/8,10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.0.0/24,192.0.2.0/24,192.88.99.0/24,192.168.0.0/16,198.18.0.0/15,198.51.100.0/24,203.0.113.0/24,224.0.0.0/4,240.0.0.0/4,255.255.255.255/32 -j RETURN
+
+            # Redirect UDP 53 (DNS) to Tor's DNS
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A PREROUTING -p udp --dport 53         -j REDIRECT --to-ports 5353
+            $IPTABLES_BIN $use_iptables_lock -o ${LXC_BRIDGE} -t nat   -$A OUTPUT     -p udp --dport 53         -j REDIRECT --to-ports 5353
+
+            # Route TCP to Tor (Tor doesn't support UDP)
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A PREROUTING -p tcp              --syn -j REDIRECT --to-ports 9040
+            $IPTABLES_BIN $use_iptables_lock -o ${LXC_BRIDGE} -t nat   -$A OUTPUT     -p tcp              --syn -j REDIRECT --to-ports 9040
+
+            # Drop otherwise unmatched packets
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A PREROUTING  -j RETURN
+            $IPTABLES_BIN $use_iptables_lock -i ${LXC_BRIDGE} -t nat   -$A INPUT       -j RETURN
+            $IPTABLES_BIN $use_iptables_lock -o ${LXC_BRIDGE} -t nat   -$A OUTPUT      -j RETURN
+            ;;
+
+        *)
+
+            if [ -n "$LXC_IPV6_ARG" ] && [ "$LXC_IPV6_NAT" = "true" ]; then
+                $IP6TABLES_BIN $use_iptables_lock -t nat -$A POSTROUTING -s ${LXC_IPV6_NETWORK} ! -d ${LXC_IPV6_NETWORK} -j MASQUERADE
+            fi
+            $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p udp --dport 67 -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p tcp --dport 67 -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p udp --dport 53 -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -$I INPUT -i ${LXC_BRIDGE} -p tcp --dport 53 -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -$I FORWARD -i ${LXC_BRIDGE} -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -$I FORWARD -o ${LXC_BRIDGE} -j ACCEPT
+            $IPTABLES_BIN $use_iptables_lock -t nat -$A POSTROUTING -s ${LXC_NETWORK} ! -d ${LXC_NETWORK} -j MASQUERADE
+            $IPTABLES_BIN $use_iptables_lock -t mangle -$A POSTROUTING -o ${LXC_BRIDGE} -p udp -m udp --dport 68 -j CHECKSUM --checksum-fill
+
+            ;;
+    esac
 }
 
 start_iptables() {
